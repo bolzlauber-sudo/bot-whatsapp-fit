@@ -7,9 +7,9 @@ import pytz
 
 app = Flask(__name__)
 
-# --- 1. CONFIGURAÇÕES (Preencha com seus dados) ---
+# --- 1. CONFIGURAÇÕES (Limpas e Organizadas) ---
 EVO_URL = "https://evolution-api-production-1fac.up.railway.app"
-EVO_KEY = "bolzlauber64" # Aquela que você criou na Railway
+EVO_KEY = "bolzlauber64"
 INSTANCIA = "Personal_Bot"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -25,21 +25,25 @@ LINKS_AFILIADO = {
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-# Cria a tabela de memória se não existir
-conn = get_db_connection()
-cur = conn.cursor()
-cur.execute('''
-    CREATE TABLE IF NOT EXISTS historico (
-        id SERIAL PRIMARY KEY,
-        numero TEXT,
-        role TEXT,
-        content TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-conn.commit()
-cur.close()
-conn.close()
+# Inicializa o banco de dados
+try:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS historico (
+            id SERIAL PRIMARY KEY,
+            numero TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("Banco de dados verificado com sucesso!")
+except Exception as e:
+    print(f"Erro ao conectar no banco: {e}")
 
 def obter_saudacao_periodo():
     fuso = pytz.timezone('America/Sao_Paulo')
@@ -51,19 +55,32 @@ def obter_saudacao_periodo():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     dados = request.get_json()
+    
+    # Verifica se o evento é de mensagem
     if dados.get("event") == "messages.upsert":
         try:
-            numero_jid = dados['data']['key']['remoteJid']
-            nome = dados['data'].get('pushName', 'Campeão')
-            msg = dados['data']['message'].get('conversation') or \
-                  dados['data']['message'].get('extendedTextMessage', {}).get('text', '')
+            # Extração de dados da Evolution API v1.x/v2.x
+            data = dados['data']
+            # Se for v2, a estrutura pode mudar levemente, mas esse padrão é o mais comum:
+            numero_jid = data['key']['remoteJid']
+            nome = data.get('pushName', 'Campeão')
+            
+            # Pega o texto da mensagem
+            msg = ""
+            message_obj = data.get('message', {})
+            if 'conversation' in message_obj:
+                msg = message_obj['conversation']
+            elif 'extendedTextMessage' in message_obj:
+                msg = message_obj['extendedTextMessage'].get('text', '')
 
-            if not msg: return "OK", 200
+            if not msg: 
+                return "OK", 200
 
             # --- A. SALVAR NA MEMÓRIA E BUSCAR HISTÓRICO ---
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("INSERT INTO historico (numero, role, content) VALUES (%s, %s, %s)", (numero_jid, 'user', msg))
+            
             cur.execute("SELECT role, content FROM historico WHERE numero = %s ORDER BY timestamp DESC LIMIT 10", (numero_jid,))
             rows = cur.fetchall()
             historico_formatado = [{"role": r, "content": c} for r, c in reversed(rows)]
@@ -88,7 +105,13 @@ def webhook():
                 json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.7},
                 headers={"Authorization": f"Bearer {OPENAI_KEY}"}
             )
-            resposta_texto = res_ai.json()['choices'][0]['message']['content']
+            
+            resposta_json = res_ai.json()
+            if 'choices' in resposta_json:
+                resposta_texto = resposta_json['choices'][0]['message']['content']
+            else:
+                print(f"Erro OpenAI: {resposta_json}")
+                return "Erro OpenAI", 500
 
             # --- D. SALVAR RESPOSTA E ENVIAR WHATSAPP ---
             cur.execute("INSERT INTO historico (numero, role, content) VALUES (%s, %s, %s)", (numero_jid, 'assistant', resposta_texto))
@@ -96,9 +119,18 @@ def webhook():
             cur.close()
             conn.close()
 
-            requests.post(f"{EVO_URL}/message/sendText/{INSTANCIA}", 
-                          json={"number": numero_jid, "text": resposta_texto}, 
-                          headers={"apikey": EVO_KEY})
+            # Limpa o JID para enviar apenas o número (ex: 551199999999)
+            numero_puro = numero_jid.split('@')[0]
+
+            # Envia para a Evolution
+            url_final = f"{EVO_URL}/message/sendText/{INSTANCIA}"
+            payload = {
+                "number": numero_puro,
+                "text": resposta_texto
+            }
+            
+            envio = requests.post(url_final, json=payload, headers={"apikey": EVO_KEY})
+            print(f"Status Envio: {envio.status_code} - Resposta: {envio.text}")
 
         except Exception as e:
             print(f"Erro no processamento: {e}")
