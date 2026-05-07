@@ -14,73 +14,37 @@ INSTANCIA = "Personal_Bot"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-MSG_PAGAMENTO = (
-    "🚀 *PRONTO PARA COMEÇAR?*\n\n"
-    "Para liberar seu acesso VIP agora, efetue o pagamento da mensalidade:\n\n"
-    "💰 *Valor:* R$ 15,00\n"
-    "🔑 *PIX (Celular):* 42988065394\n\n"
-    "Após pagar, *envie o comprovante aqui no chat* para que o Henrique libere seu acesso! 🔥"
-)
-
 def log_print(mensagem):
     print(f"===> COACH_MAX_LOG: {mensagem}", file=sys.stderr, flush=True)
 
-# --- FUNÇÃO DE LIMPEZA E CRIAÇÃO DO BANCO ---
+# --- FUNÇÃO RESET TOTAL DO BANCO ---
 def inicializar_banco():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         
-        # Este comando cria a tabela do zero se ela não tiver as colunas certas
+        log_print("A apagar tabela antiga para reset...")
+        cur.execute("DROP TABLE IF EXISTS memoria_usuario CASCADE")
+        
+        log_print("A criar nova tabela com todas as colunas...")
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS memoria_usuario (
+            CREATE TABLE memoria_usuario (
                 jid TEXT PRIMARY KEY,
                 contexto TEXT,
-                data_vencimento DATE DEFAULT CURRENT_DATE,
+                data_vencimento DATE NOT NULL,
                 pago BOOLEAN DEFAULT FALSE,
                 ja_se_apresentou BOOLEAN DEFAULT FALSE
             )
         """)
         
-        # Garante que as colunas existam (caso a tabela já existisse sem elas)
-        colunas = [
-            ("data_vencimento", "DATE DEFAULT CURRENT_DATE"),
-            ("pago", "BOOLEAN DEFAULT FALSE"),
-            ("ja_se_apresentou", "BOOLEAN DEFAULT FALSE")
-        ]
-        
-        for col, tipo in colunas:
-            try:
-                cur.execute(f"ALTER TABLE memoria_usuario ADD COLUMN {col} {tipo}")
-                log_print(f"Coluna {col} verificada/adicionada.")
-            except:
-                conn.rollback()
-        
         conn.commit()
         cur.close()
         conn.close()
-        log_print("Banco de dados sincronizado com sucesso!")
+        log_print("BANCO DE DADOS RESETADO E PRONTO!")
     except Exception as e:
-        log_print(f"Erro ao sincronizar banco: {e}")
+        log_print(f"ERRO CRÍTICO NO RESET: {e}")
 
-def liberar_aluno(jid):
-    try:
-        nova_data = datetime.now().date() + timedelta(days=30)
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO memoria_usuario (jid, data_vencimento, pago, ja_se_apresentou) 
-            VALUES (%s, %s, TRUE, TRUE)
-            ON CONFLICT (jid) DO UPDATE SET data_vencimento = %s, pago = TRUE, ja_se_apresentou = TRUE
-        """, (jid, nova_data, nova_data))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        log_print(f"Erro ao salvar liberação: {e}")
-        return False
-
+# Executa o reset assim que o app ligar
 inicializar_banco()
 
 @app.route("/webhook", methods=["POST"])
@@ -97,19 +61,27 @@ def webhook():
 
             if not numero_jid: return "OK", 200
 
-            # COMANDO ADMIN
+            # --- COMANDO DE ADMIN (#liberar) ---
             if from_me and texto.lower() == "#liberar":
-                if liberar_aluno(numero_jid):
-                    resp = "✅ *ACESSO VIP LIBERADO POR 30 DIAS!*"
-                else:
-                    resp = "❌ Erro ao salvar no banco."
+                nova_data = datetime.now().date() + timedelta(days=30)
+                conn = psycopg2.connect(DATABASE_URL)
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO memoria_usuario (jid, data_vencimento, pago, ja_se_apresentou) 
+                    VALUES (%s, %s, TRUE, TRUE)
+                    ON CONFLICT (jid) DO UPDATE SET data_vencimento = %s, pago = TRUE, ja_se_apresentou = TRUE
+                """, (numero_jid, nova_data, nova_data))
+                conn.commit()
+                cur.close()
+                conn.close()
+                
                 requests.post(f"{EVO_URL}/message/sendText/{INSTANCIA}", 
-                              json={"number": numero_jid, "text": resp}, headers={"apikey": EVO_KEY})
+                              json={"number": numero_jid, "text": "✅ *ACESSO LIBERADO!*"}, headers={"apikey": EVO_KEY})
                 return "OK", 200
 
             if from_me: return "OK", 200
 
-            # VERIFICAÇÃO NO BANCO
+            # --- VERIFICAÇÃO DE ACESSO ---
             conn = psycopg2.connect(DATABASE_URL)
             cur = conn.cursor()
             cur.execute("SELECT data_vencimento, pago FROM memoria_usuario WHERE jid = %s", (numero_jid,))
@@ -123,11 +95,12 @@ def webhook():
                     autorizado = True
 
             if not autorizado:
+                msg_pix = "🚀 *COACH MAX I.A*\n\nPara acesso, faça o PIX: 42988065394 (R$ 15,00)"
                 requests.post(f"{EVO_URL}/message/sendText/{INSTANCIA}", 
-                              json={"number": numero_jid, "text": MSG_PAGAMENTO}, headers={"apikey": EVO_KEY})
+                              json={"number": numero_jid, "text": msg_pix}, headers={"apikey": EVO_KEY})
                 return "OK", 200
 
-            # RESPOSTA IA
+            # --- RESPOSTA DA IA ---
             res_ai = requests.post("https://api.openai.com/v1/chat/completions",
                 json={
                     "model": "gpt-3.5-turbo", 
@@ -140,7 +113,7 @@ def webhook():
                           json={"number": numero_jid, "text": resposta_ia}, headers={"apikey": EVO_KEY})
 
         except Exception as e:
-            log_print(f"Erro no Webhook: {e}")
+            log_print(f"Erro: {e}")
     return "OK", 200
 
 if __name__ == "__main__":
