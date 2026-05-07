@@ -7,133 +7,90 @@ import pytz
 
 app = Flask(__name__)
 
-# --- 1. CONFIGURAÇÕES (Limpas e Organizadas) ---
+# --- 1. CONFIGURAÇÕES ---
 EVO_URL = "https://evolution-api-production-1fac.up.railway.app"
 EVO_KEY = "bolzlauber64"
 INSTANCIA = "Personal_Bot"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# --- 2. SEUS LINKS DE AFILIADO MERCADO LIVRE ---
 LINKS_AFILIADO = {
     "CREATINA": "https://meli.la/1QDAB5o",
     "WHEY": "https://meli.la/22YCUoj",
     "GERAL": "https://meli.la/1CPN7GJ"
 }
 
-# --- 3. BANCO DE DADOS E MEMÓRIA ---
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-# Inicializa o banco de dados
-try:
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS historico (
-            id SERIAL PRIMARY KEY,
-            numero TEXT,
-            role TEXT,
-            content TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("Banco de dados verificado com sucesso!")
-except Exception as e:
-    print(f"Erro ao conectar no banco: {e}")
-
-def obter_saudacao_periodo():
-    fuso = pytz.timezone('America/Sao_Paulo')
-    hora = datetime.now(fuso).hour
-    if 5 <= hora < 12: return "Bom dia! Já mandou o café da manhã pra dentro?"
-    elif 12 <= hora < 18: return "Boa tarde! Bora que o foco não pode parar!"
-    else: return "Boa noite! Disciplina até o fim do dia, hein?"
+# Inicializa tabela
+conn = get_db_connection()
+cur = conn.cursor()
+cur.execute('CREATE TABLE IF NOT EXISTS historico (id SERIAL PRIMARY KEY, numero TEXT, role TEXT, content TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+conn.commit()
+cur.close()
+conn.close()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     dados = request.get_json()
-    
-    # Verifica se o evento é de mensagem
-    if dados.get("event") == "messages.upsert":
-        try:
-            # Extração de dados da Evolution API v1.x/v2.x
-            data = dados['data']
-            # Se for v2, a estrutura pode mudar levemente, mas esse padrão é o mais comum:
-            numero_jid = data['key']['remoteJid']
-            nome = data.get('pushName', 'Campeão')
-            
-            # Pega o texto da mensagem
-            msg = ""
-            message_obj = data.get('message', {})
-            if 'conversation' in message_obj:
-                msg = message_obj['conversation']
-            elif 'extendedTextMessage' in message_obj:
-                msg = message_obj['extendedTextMessage'].get('text', '')
+    print(f"Recebido: {dados}") # Isso vai mostrar o erro real no log do Render
 
-            if not msg: 
-                return "OK", 200
+    if not dados or "data" not in dados:
+        return "OK", 200
 
-            # --- A. SALVAR NA MEMÓRIA E BUSCAR HISTÓRICO ---
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("INSERT INTO historico (numero, role, content) VALUES (%s, %s, %s)", (numero_jid, 'user', msg))
-            
-            cur.execute("SELECT role, content FROM historico WHERE numero = %s ORDER BY timestamp DESC LIMIT 10", (numero_jid,))
-            rows = cur.fetchall()
-            historico_formatado = [{"role": r, "content": c} for r, c in reversed(rows)]
-            
-            # --- B. O "CÉREBRO" DO COACH MAX ---
-            system_prompt = (
-                f"Você é o Coach Max, Personal e Nutricionista. {obter_saudacao_periodo()} "
-                f"O cliente se chama {nome}. Sua missão é ser prático, animado e técnico.\n\n"
-                "DIRETRIZES:\n"
-                "1. Peça peso, altura e objetivo se for o início.\n"
-                "2. Se ele citar cansaço ou falta de força, indique CREATINA: " + LINKS_AFILIADO['CREATINA'] + "\n"
-                "3. Se ele citar fome ou falta de proteína, indique WHEY: " + LINKS_AFILIADO['WHEY'] + "\n"
-                "4. Adapte treinos para dores ou lesões relatadas no histórico.\n"
-                "5. Use negrito, emojis e listas. Seja o coach que todos amam!"
-            )
+    try:
+        # Extração ultra segura dos dados
+        data_body = dados.get("data", {})
+        key = data_body.get("key", {})
+        numero_jid = key.get("remoteJid")
+        nome = data_body.get("pushName", "Campeão")
+        
+        # Tenta pegar o texto de qualquer lugar que ele venha
+        message = data_body.get("message", {})
+        msg = (message.get("conversation") or 
+               message.get("extendedTextMessage", {}).get("text") or 
+               message.get("text") or "")
 
-            messages = [{"role": "system", "content": system_prompt}] + historico_formatado
+        if not msg or not numero_jid:
+            return "OK", 200
 
-            # --- C. CHAMADA OPENAI ---
-            res_ai = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.7},
-                headers={"Authorization": f"Bearer {OPENAI_KEY}"}
-            )
-            
-            resposta_json = res_ai.json()
-            if 'choices' in resposta_json:
-                resposta_texto = resposta_json['choices'][0]['message']['content']
-            else:
-                print(f"Erro OpenAI: {resposta_json}")
-                return "Erro OpenAI", 500
+        # 1. Banco de Dados
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO historico (numero, role, content) VALUES (%s, %s, %s)", (numero_jid, 'user', msg))
+        cur.execute("SELECT role, content FROM historico WHERE numero = %s ORDER BY timestamp DESC LIMIT 6", (numero_jid,))
+        rows = cur.fetchall()
+        historico = [{"role": r, "content": c} for r, c in reversed(rows)]
 
-            # --- D. SALVAR RESPOSTA E ENVIAR WHATSAPP ---
-            cur.execute("INSERT INTO historico (numero, role, content) VALUES (%s, %s, %s)", (numero_jid, 'assistant', resposta_texto))
-            conn.commit()
-            cur.close()
-            conn.close()
+        # 2. IA
+        prompt = f"Você é o Coach Max. Cliente: {nome}. Seja motivador e use os links: {LINKS_AFILIADO}"
+        messages = [{"role": "system", "content": prompt}] + historico
+        
+        res_ai = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            json={"model": "gpt-4o-mini", "messages": messages},
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"}
+        ).json()
+        
+        resposta_texto = res_ai['choices'][0]['message']['content']
 
-            # Limpa o JID para enviar apenas o número (ex: 551199999999)
-            numero_puro = numero_jid.split('@')[0]
+        # 3. Salvar Resposta IA
+        cur.execute("INSERT INTO historico (numero, role, content) VALUES (%s, %s, %s)", (numero_jid, 'assistant', resposta_texto))
+        conn.commit()
+        cur.close()
+        conn.close()
 
-            # Envia para a Evolution
-            url_final = f"{EVO_URL}/message/sendText/{INSTANCIA}"
-            payload = {
-                "number": numero_puro,
-                "text": resposta_texto
-            }
-            
-            envio = requests.post(url_final, json=payload, headers={"apikey": EVO_KEY})
-            print(f"Status Envio: {envio.status_code} - Resposta: {envio.text}")
+        # 4. Enviar para o Whats (Evolution)
+        numero_puro = numero_jid.split('@')[0]
+        requests.post(
+            f"{EVO_URL}/message/sendText/{INSTANCIA}",
+            json={"number": numero_puro, "text": resposta_texto},
+            headers={"apikey": EVO_KEY}
+        )
 
-        except Exception as e:
-            print(f"Erro no processamento: {e}")
+    except Exception as e:
+        print(f"ERRO CRÍTICO: {e}")
 
     return "OK", 200
 
