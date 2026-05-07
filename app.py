@@ -13,18 +13,7 @@ EVO_KEY = "A9A38878F984-40BF-88BD-15FA346F642D"
 INSTANCIA = "Personal_Bot"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-MEU_NUMERO = "554288342887"
-
-# MENSAGENS PROGRAMADAS
-MSG_APRESENTACAO = (
-    "👋 *Olá! Sou o Coach Max I.A.*\n\n"
-    "Estou aqui para ser seu parceiro de evolução! Vou te ajudar com:\n"
-    "✅ Treinos Personalizados\n"
-    "✅ Sugestões de Dietas e Receitas\n"
-    "✅ Dicas de Suplementação\n"
-    "✅ Organização de Agenda e muito mais.\n\n"
-    "------------------------------------------"
-)
+MEU_NUMERO = "554288342887" # Garanta que esse é o número que aparece no log da API
 
 MSG_PAGAMENTO = (
     "🚀 *PRONTO PARA COMEÇAR?*\n\n"
@@ -54,7 +43,7 @@ def inicializar_banco():
         cur.close()
         conn.close()
     except Exception as e:
-        log_print(f"Erro banco: {e}")
+        log_print(f"Erro ao iniciar banco: {e}")
 
 def verificar_usuario(jid):
     try:
@@ -63,7 +52,6 @@ def verificar_usuario(jid):
         cur.execute("SELECT data_vencimento, pago, ja_se_apresentou FROM memoria_usuario WHERE jid = %s", (jid,))
         res = cur.fetchone()
         
-        # Se não existe no banco, cria o registro inicial como "não pago" e "não apresentado"
         if not res:
             cur.execute("INSERT INTO memoria_usuario (jid, pago, ja_se_apresentou) VALUES (%s, FALSE, FALSE)", (jid,))
             conn.commit()
@@ -75,39 +63,33 @@ def verificar_usuario(jid):
         conn.close()
         vencimento, pago, apresentado = res
         
+        hoje = datetime.now().date()
         if not pago: return False, "nao_pago", apresentado
-        if vencimento < datetime.now().date(): return False, "vencido", apresentado
+        if vencimento < hoje: return False, "vencido", apresentado
         
         return True, "liberado", apresentado
-    except:
+    except Exception as e:
+        log_print(f"Erro verificar user: {e}")
         return False, "erro", True
-
-def marcar_apresentado(jid):
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("UPDATE memoria_usuario SET ja_se_apresentou = TRUE WHERE jid = %s", (jid,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except:
-        pass
 
 def liberar_aluno(jid):
     try:
         nova_data = datetime.now().date() + timedelta(days=30)
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
+        # Aqui o comando força o PAGO como TRUE e atualiza a data
         cur.execute("""
-            UPDATE memoria_usuario 
-            SET data_vencimento = %s, pago = TRUE, ja_se_apresentou = TRUE 
-            WHERE jid = %s
-        """, (nova_data, jid))
+            INSERT INTO memoria_usuario (jid, data_vencimento, pago, ja_se_apresentou) 
+            VALUES (%s, %s, TRUE, TRUE)
+            ON CONFLICT (jid) DO UPDATE SET data_vencimento = %s, pago = TRUE, ja_se_apresentou = TRUE
+        """, (jid, nova_data, nova_data))
         conn.commit()
         cur.close()
         conn.close()
+        log_print(f"Usuário {jid} LIBERADO até {nova_data}")
         return True
-    except:
+    except Exception as e:
+        log_print(f"Erro ao liberar no banco: {e}")
         return False
 
 inicializar_banco()
@@ -127,37 +109,36 @@ def webhook():
             if not numero_jid: return "OK", 200
 
             # --- COMANDO DE ADMIN (#liberar) ---
+            # Melhoria: Aceita com ou sem maiúsculas
             if from_me and texto.lower() == "#liberar":
                 if liberar_aluno(numero_jid):
-                    resp = "✅ *ACESSO LIBERADO!*\n\nO Coach Max agora está disponível para você por 30 dias. Pode mandar sua primeira dúvida!"
-                    requests.post(f"{EVO_URL}/message/sendText/{INSTANCIA}", 
-                                  json={"number": numero_jid, "text": resp}, headers={"apikey": EVO_KEY})
+                    resp = "✅ *ACESSO VIP LIBERADO POR 30 DIAS!*\n\nCoach Max está pronto. Como posso te ajudar hoje?"
+                else:
+                    resp = "❌ Erro técnico ao liberar no banco de dados."
+                
+                requests.post(f"{EVO_URL}/message/sendText/{INSTANCIA}", 
+                              json={"number": numero_jid, "text": resp}, headers={"apikey": EVO_KEY})
                 return "OK", 200
 
-            # --- LÓGICA DE ACESSO E BOAS-VINDAS ---
+            # --- SE FOR VOCÊ MANDANDO MENSAGEM (Ignore travas) ---
+            if from_me: return "OK", 200
+
+            # --- VERIFICAÇÃO DE ACESSO ---
             autorizado, status, ja_apresentou = verificar_usuario(numero_jid)
 
-            if not autorizado and not from_me:
-                # Se for a primeira vez dele (status "novo" e não apresentou)
-                if not ja_apresentou:
-                    # Manda Apresentação + Pix
-                    msg_completa = f"{MSG_APRESENTACAO}\n\n{MSG_PAGAMENTO}"
-                    marcar_apresentado(numero_jid)
-                else:
-                    # Manda apenas o Pix (cobrança comum)
-                    msg_completa = MSG_PAGAMENTO if status == "nao_pago" else "⏳ *SUA ASSINATURA VENCEU!*\n\n" + MSG_PAGAMENTO
-
+            if not autorizado:
+                msg_bloqueio = "⏳ *SUA ASSINATURA VENCEU!*\n\n" + MSG_PAGAMENTO if status == "vencido" else MSG_PAGAMENTO
                 requests.post(f"{EVO_URL}/message/sendText/{INSTANCIA}", 
-                              json={"number": numero_jid, "text": msg_completa}, headers={"apikey": EVO_KEY})
+                              json={"number": numero_jid, "text": msg_bloqueio}, headers={"apikey": EVO_KEY})
                 return "OK", 200
 
-            # --- RESPOSTA DA IA (SÓ PARA LIBERADOS) ---
-            if texto and not from_me:
+            # --- RESPOSTA DA IA ---
+            if texto:
                 res_ai = requests.post("https://api.openai.com/v1/chat/completions",
                     json={
                         "model": "gpt-3.5-turbo", 
                         "messages": [
-                            {"role": "system", "content": "Você é o Coach Max, assistente fitness VIP. Ajude com treinos, dietas e dúvidas."},
+                            {"role": "system", "content": "Você é o Coach Max, assistente fitness VIP."},
                             {"role": "user", "content": texto}
                         ]
                     },
@@ -168,7 +149,7 @@ def webhook():
                               json={"number": numero_jid, "text": resposta_ia}, headers={"apikey": EVO_KEY})
 
         except Exception as e:
-            log_print(f"Erro: {e}")
+            log_print(f"Erro geral: {e}")
     return "OK", 200
 
 if __name__ == "__main__":
